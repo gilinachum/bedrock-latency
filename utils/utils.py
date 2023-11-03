@@ -1,7 +1,10 @@
 import anthropic, boto3, botocore, os, random, pprint
-import matplotlib.pyplot as plt
+import time, json
+from botocore.exceptions import ClientError
 
 anthropic_client = anthropic.Anthropic() # used to count tokens only
+client_per_region={}
+sleep_on_throttling_sec = 5
 
 # This internal method will include arbitrary long input that is designed to generate an extremely long model output
 def _get_prompt_template(num_input_tokens):
@@ -28,11 +31,6 @@ def create_prompt(expected_num_tokens):
     assert expected_num_tokens==actual_num_tokens, f'Failed to generate prompt at required length: expected_num_tokens{expected_num_tokens} != actual_num_tokens={actual_num_tokens}'
     
     return prompt_template
-
-
-import time, json
-from botocore.exceptions import ClientError
-sleep_on_throttling_sec = 5
 
 def benchmark(bedrock, prompt, max_tokens_to_sample, stream=True, temprature=0):
     modelId = 'anthropic.claude-v2'
@@ -89,7 +87,7 @@ def benchmark(bedrock, prompt, max_tokens_to_sample, stream=True, temprature=0):
     return duration_to_first_byte, duration_to_last_byte
 
 
-def execute_benchmark(scenarios,scenario_config, early_break):
+def execute_benchmark(scenarios,scenario_config, early_break = False):
     pp = pprint.PrettyPrinter(indent=2)
     for scenario in scenarios:
         for i in range(scenario_config["invocations_per_scenario"]): # increase to sample each use case more than once to discover jitter
@@ -114,9 +112,8 @@ def execute_benchmark(scenarios,scenario_config, early_break):
                 print(f"Error while processing scenario: {scenario['name']}.")
             if early_break:
                 break
-    show_results(scenarios)
+    return scenarios
 
-import time
 ''' 
 Get a boto3 bedrock runtime client for invoking requests
 region - the AWS region to use
@@ -133,7 +130,7 @@ def _get_bedrock_client(region, warmup=True):
 '''
 Get a possible cache client per AWS region 
 '''
-client_per_region={}
+
 def get_cached_client(region):
     if client_per_region.get(region) is None:
         client_per_region[region] = _get_bedrock_client(region)
@@ -145,22 +142,3 @@ def post_iteration(is_last_invocation, scenario_config):
         print(f'Sleeping for {scenario_config["sleep_between_invocations"]} seconds.')
         time.sleep(scenario_config["sleep_between_invocations"])
         
-def show_results(scenarios):
-
-    fig, ax = plt.subplots()
-
-    metric = 'time-to-first-token'
-    #metric = 'time-to-last-token'
-
-    for scenario in scenarios:
-      durations = [d[metric] for d in scenario['durations']]
-
-      ax.boxplot(durations, positions=[scenarios.index(scenario)])
-
-      ax.set_xticks(range(len(scenarios)))
-      ax.set_xticklabels([s['name'] for s in scenarios])
-
-      ax.set_ylabel(f'{metric} (sec)')
-
-    fig.tight_layout()
-    plt.show()
