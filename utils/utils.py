@@ -2,9 +2,7 @@ import anthropic, boto3, botocore, os, random, pprint
 import time, json
 from botocore.exceptions import ClientError
 
-anthropic_client = anthropic.Anthropic() # used to count tokens only
-client_per_region={}
-sleep_on_throttling_sec = 5
+SLEEP_ON_THROTTLING_SEC = 5
 
 # This internal method will include arbitrary long input that is designed to generate an extremely long model output
 def _get_prompt_template(num_input_tokens):
@@ -20,6 +18,7 @@ def _get_prompt_template(num_input_tokens):
 ''' 
 This method creates a prompt of input length `expected_num_tokens` which instructs the LLM to generate extremely long model resopnse
 '''
+anthropic_client = anthropic.Anthropic() # used to count tokens only
 def create_prompt(expected_num_tokens):
     num_tokens_in_prompt_template = anthropic_client.count_tokens(_get_prompt_template(0))
     additional_tokens_needed = max(expected_num_tokens - num_tokens_in_prompt_template,0)
@@ -32,7 +31,23 @@ def create_prompt(expected_num_tokens):
     
     return prompt_template
 
-def benchmark(bedrock, prompt, max_tokens_to_sample, stream=True, temprature=0):
+'''
+This method will invoke the model, possibly in streaming mode,
+In case of throttling error, the method will retry. Throttling and related sleep time isn't measured.
+The method ensures the response includes `max_tokens_to_sample` by verify the stop_reason is `max_tokens`
+
+bedrock - the bedrock client to invoke the model
+prompt - the prompt to send to the model
+max_tokens_to_sample - the number of tokens to sample from the model's response
+stream - whether to invoke the model in streaming mode
+temperature - the temperature to use for sampling the model's response
+
+Returns the time to first byte, last byte, and invocation time as iso8601 (seconds)
+'''
+def benchmark(bedrock, prompt, max_tokens_to_sample, stream=True, temperature=0):
+    import time
+    from datetime import datetime
+    import pytz
     modelId = 'anthropic.claude-v2'
     accept = 'application/json'
     contentType = 'application/json'
@@ -40,19 +55,22 @@ def benchmark(bedrock, prompt, max_tokens_to_sample, stream=True, temprature=0):
     body = json.dumps({
     "prompt": prompt,
     "max_tokens_to_sample": max_tokens_to_sample,
-    "temperature": 0,
+    "temperature": temperature,
 })
     while True:
         try:
             start = time.time()
-
             if stream:
-                response = bedrock.invoke_model_with_response_stream(body=body, modelId=modelId, accept=accept, contentType=contentType)
+                response = bedrock.invoke_model_with_response_stream(
+                    body=body, modelId=modelId, accept=accept, contentType=contentType)
             else:
-                response = bedrock.invoke_model(body=body, modelId=modelId, accept=accept, contentType=contentType)
+                response = bedrock.invoke_model(
+                    body=body, modelId=modelId, accept=accept, contentType=contentType)
             #print(response)
             
             first_byte = None
+            dt = datetime.fromtimestamp(time.time(), tz=pytz.utc)
+            invocation_timestamp_iso = dt.strftime('%Y-%m-%dT%H:%M:%SZ')
             if stream:
                 event_stream = response.get('body')
                 for event in event_stream:
@@ -75,36 +93,46 @@ def benchmark(bedrock, prompt, max_tokens_to_sample, stream=True, temprature=0):
             # verify we got all of the intended output tokens by verifying stop_reason
             assert stop_reason == 'max_tokens', f"stop_reason is {stop_reason} instead of 'max_tokens', this means the model generated less tokens than required."
 
-            duration_to_first_byte = first_byte - start
-            duration_to_last_byte = last_byte - start
+            duration_to_first_byte = round(first_byte - start, 2)
+            duration_to_last_byte = round(last_byte - start, 2)
         except ClientError as err:
             if 'Thrott' in err.response['Error']['Code']:
-                print(f'Got ThrottlingException. Sleeping {sleep_on_throttling_sec} sec and retrying.')
-                time.sleep(sleep_on_throttling_sec)
+                print(f'Got ThrottlingException. Sleeping {SLEEP_ON_THROTTLING_SEC} sec and retrying.')
+                time.sleep(SLEEP_ON_THROTTLING_SEC)
                 continue
             raise err
         break
-    return duration_to_first_byte, duration_to_last_byte
+    return duration_to_first_byte, duration_to_last_byte, invocation_timestamp_iso
 
 
-def execute_benchmark(scenarios,scenario_config, early_break = False):
+'''
+This method will benchmark the given scenarios.
+scenarios - a list of scenarios to benchmark
+scenario_config - a dictionary of configuration parameters
+early_break - if true, will break after a single scenario, useful for debugging.
+Returns a list of benchmarked scenarios with a list of invocation (latency and timestamp)
+'''
+def execute_benchmark(scenarios, scenario_config, early_break = False):
+    scenarios = scenarios.copy()
     pp = pprint.PrettyPrinter(indent=2)
     for scenario in scenarios:
         for i in range(scenario_config["invocations_per_scenario"]): # increase to sample each use case more than once to discover jitter
             try:
                 prompt = create_prompt(scenario['in_tokens'])
                 client = get_cached_client(scenario['region'])
-                time_to_first_token,time_to_last_token = benchmark(client, prompt, scenario['out_tokens'], stream=scenario['stream'])
+                time_to_first_token, time_to_last_token, timestamp = benchmark(client, prompt, scenario['out_tokens'], stream=scenario['stream'])
 
-                if 'durations' not in scenario: scenario['durations'] = list()
-                duration = {
+                if 'invocations' not in scenario: scenario['invocations'] = list()
+                invocation = {
                     'time-to-first-token':  time_to_first_token,
                     'time-to-last-token':  time_to_last_token,
+                    'timestamp_iso' : timestamp,
+                    
                 }
-                scenario['durations'].append(duration)
+                scenario['invocations'].append(invocation)
 
                 print(f"Scenario: [{scenario['name']}, " + 
-                      f'Duration: {pp.pformat((duration))}')
+                      f'invocation: {pp.pformat((invocation))}')
 
                 post_iteration(is_last_invocation = i == scenario_config["invocations_per_scenario"] - 1, scenario_config=scenario_config)
             except Exception as e:
@@ -113,6 +141,7 @@ def execute_benchmark(scenarios,scenario_config, early_break = False):
             if early_break:
                 break
     return scenarios
+
 
 ''' 
 Get a boto3 bedrock runtime client for invoking requests
@@ -130,7 +159,7 @@ def _get_bedrock_client(region, warmup=True):
 '''
 Get a possible cache client per AWS region 
 '''
-
+client_per_region={}
 def get_cached_client(region):
     if client_per_region.get(region) is None:
         client_per_region[region] = _get_bedrock_client(region)
@@ -142,3 +171,31 @@ def post_iteration(is_last_invocation, scenario_config):
         print(f'Sleeping for {scenario_config["sleep_between_invocations"]} seconds.')
         time.sleep(scenario_config["sleep_between_invocations"])
         
+
+'''
+This method draws a boxplot graph of each scenario.
+scenarios - list of scenarios
+title - title of the graph
+metric - metric to be plotted (time-to-first-token or time-to-last-token)
+'''
+def graph_scenarios_boxplot(scenarios, title, metric = 'time-to-first-token'):
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    xlables = []
+
+    for scenario in scenarios:
+      invocations = [d[metric] for d in scenario['invocations']]
+      percentile_95 = round(np.percentile(invocations, 95),2)
+      percentile_99 = round(np.percentile(invocations, 99),2)
+      xlables.append(f"{scenario['name']}\np95={percentile_95}\np99={percentile_99}")
+
+      ax.boxplot(invocations, positions=[scenarios.index(scenario)])
+
+    ax.set_title(title)
+    ax.set_xticks(range(len(scenarios)))
+    ax.set_xticklabels(xlables)
+    ax.set_ylabel(f'{metric} (sec)')
+    fig.tight_layout()
+    plt.show()
