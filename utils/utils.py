@@ -44,11 +44,10 @@ temperature - the temperature to use for sampling the model's response
 
 Returns the time to first byte, last byte, and invocation time as iso8601 (seconds)
 '''
-def benchmark(bedrock, prompt, max_tokens_to_sample, stream=True, temperature=0):
+def benchmark(bedrock, modelId, prompt, max_tokens_to_sample, stream=True, temperature=0):
     import time
     from datetime import datetime
     import pytz
-    modelId = 'anthropic.claude-v2'
     accept = 'application/json'
     contentType = 'application/json'
     
@@ -119,8 +118,9 @@ def execute_benchmark(scenarios, scenario_config, early_break = False):
         for i in range(scenario_config["invocations_per_scenario"]): # increase to sample each use case more than once to discover jitter
             try:
                 prompt = create_prompt(scenario['in_tokens'])
+                modelId = scenario['model_id']
                 client = get_cached_client(scenario['region'])
-                time_to_first_token, time_to_last_token, timestamp = benchmark(client, prompt, scenario['out_tokens'], stream=scenario['stream'])
+                time_to_first_token, time_to_last_token, timestamp = benchmark(client, modelId, prompt, scenario['out_tokens'], stream=scenario['stream'])
 
                 if 'invocations' not in scenario: scenario['invocations'] = list()
                 invocation = {
