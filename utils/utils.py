@@ -36,7 +36,8 @@ This method will invoke the model, possibly in streaming mode,
 In case of throttling error, the method will retry. Throttling and related sleep time isn't measured.
 The method ensures the response includes `max_tokens_to_sample` by verify the stop_reason is `max_tokens`
 
-bedrock - the bedrock client to invoke the model
+client - the bedrock runtime client to invoke the model
+modelId - the model id to invoke
 prompt - the prompt to send to the model
 max_tokens_to_sample - the number of tokens to sample from the model's response
 stream - whether to invoke the model in streaming mode
@@ -44,7 +45,7 @@ temperature - the temperature to use for sampling the model's response
 
 Returns the time to first byte, last byte, and invocation time as iso8601 (seconds)
 '''
-def benchmark(bedrock, modelId, prompt, max_tokens_to_sample, stream=True, temperature=0):
+def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temperature=0):
     import time
     from datetime import datetime
     import pytz
@@ -60,10 +61,10 @@ def benchmark(bedrock, modelId, prompt, max_tokens_to_sample, stream=True, tempe
         try:
             start = time.time()
             if stream:
-                response = bedrock.invoke_model_with_response_stream(
+                response = client.invoke_model_with_response_stream(
                     body=body, modelId=modelId, accept=accept, contentType=contentType)
             else:
-                response = bedrock.invoke_model(
+                response = client.invoke_model(
                     body=body, modelId=modelId, accept=accept, contentType=contentType)
             #print(response)
             
@@ -119,7 +120,7 @@ def execute_benchmark(scenarios, scenario_config, early_break = False):
             try:
                 prompt = create_prompt(scenario['in_tokens'])
                 modelId = scenario['model_id']
-                client = get_cached_client(scenario['region'])
+                client = get_cached_client(scenario['region'], scenario['model_id'])
                 time_to_first_token, time_to_last_token, timestamp = benchmark(client, modelId, prompt, scenario['out_tokens'], stream=scenario['stream'])
 
                 if 'invocations' not in scenario: scenario['invocations'] = list()
@@ -146,23 +147,26 @@ def execute_benchmark(scenarios, scenario_config, early_break = False):
 ''' 
 Get a boto3 bedrock runtime client for invoking requests
 region - the AWS region to use
+model_id_for_warm_up - the model id to warm up the client against, use None for no warmup
 Note: Removing auto retries to ensure we're measuring a single transcation (e.g., in case of throttling).
 '''
-def _get_bedrock_client(region, warmup=True):
+def _get_bedrock_client(region, model_id_for_warm_up = None):
     client = boto3.client( service_name='bedrock-runtime',
                           region_name=region,
                           config=botocore.config.Config(retries=dict(max_attempts=0))) 
-    if warmup:
-        benchmark(client, create_prompt(50), 1)
+    if model_id_for_warm_up:
+        benchmark(client, model_id_for_warm_up, create_prompt(50), 1)
     return client
 
 '''
 Get a possible cache client per AWS region 
+region - the AWS region to use
+model_id_for_warm_up - the model id to warm up the client against, use None for no warmup
 '''
 client_per_region={}
-def get_cached_client(region):
+def get_cached_client(region, model_id_for_warm_up = None):
     if client_per_region.get(region) is None:
-        client_per_region[region] = _get_bedrock_client(region)
+        client_per_region[region] = _get_bedrock_client(region, model_id_for_warm_up)
     return client_per_region[region]
 
 
