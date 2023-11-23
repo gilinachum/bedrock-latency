@@ -1,4 +1,4 @@
-import anthropic, boto3, botocore, os, random, pprint
+import anthropic, boto3, botocore, os, random, pprint, openai
 import time, json
 from botocore.exceptions import ClientError
 
@@ -30,7 +30,6 @@ def create_prompt(expected_num_tokens):
     assert expected_num_tokens==actual_num_tokens, f'Failed to generate prompt at required length: expected_num_tokens{expected_num_tokens} != actual_num_tokens={actual_num_tokens}'
     
     return prompt_template
-
 '''
 This method will invoke the model, possibly in streaming mode,
 In case of throttling error, the method will retry. Throttling and related sleep time isn't measured.
@@ -56,10 +55,33 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
     "prompt": prompt,
     "max_tokens_to_sample": max_tokens_to_sample,
     "temperature": temperature,
-})
+    })
+    
+    # Determine the service based on modelId prefix
+    is_openai_model = modelId.startswith('gpt-')
+    
     while True:
         try:
             start = time.time()
+            
+            if is_openai_model:
+                
+                response = client.chat.completions.create(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    model=modelId
+                )
+                
+                stop_reason = response['choices'][0]['finish_reason']
+                print(f'stop_reason={stop_reason}')
+                last_byte = time.time()
+                first_byte = start
+                
+                    
             if stream:
                 response = client.invoke_model_with_response_stream(
                     body=body, modelId=modelId, accept=accept, contentType=contentType)
@@ -104,7 +126,30 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
         break
     return duration_to_first_byte, duration_to_last_byte, invocation_timestamp_iso
 
+'''
+# This method fetches a secret from AWS Secrets manager
+'''
+def get_secret(secret_name):
+    # Create a Secrets Manager client
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager'
+    )
 
+    try:
+        get_secret_value_response = client.get_secret_value(
+            SecretId=secret_name
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'DecryptionFailureException':
+            # Secrets Manager can't decrypt the protected secret text using the provided KMS key.
+            # Deal with the exception here, and/or rethrow at your discretion.
+            raise e
+        elif e.response['Error']['Code'] == 'InternalServiceErrorException':
+            # An error occurred on the server side.
+            raise e
+    # return the value for the key "openai" in the secret "models"
+    return json.loads(get_secret_value_response['SecretString'])['openai']
 '''
 This method will benchmark the given scenarios.
 scenarios - a list of scenarios to benchmark
@@ -120,7 +165,17 @@ def execute_benchmark(scenarios, scenario_config, early_break = False):
             try:
                 prompt = create_prompt(scenario['in_tokens'])
                 modelId = scenario['model_id']
-                client = get_cached_client(scenario['region'], scenario['model_id'])
+                
+                # Determine the service based on modelId prefix
+                is_openai_model = modelId.startswith('gpt-')
+                
+                if is_openai_model:
+                    secret = get_secret('models')
+                    client = OpenAI(
+                        api_key=secret
+                    )
+                else:
+                    client = get_cached_client(scenario['region'], scenario['model_id'])
                 time_to_first_token, time_to_last_token, timestamp = benchmark(client, modelId, prompt, scenario['out_tokens'], stream=scenario['stream'])
 
                 if 'invocations' not in scenario: scenario['invocations'] = list()
