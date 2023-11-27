@@ -77,6 +77,7 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+.ipynb_checkpoints/*
 
 # IPython
 profile_default/
@@ -127,6 +128,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+*key.py
 
 # Spyder project settings
 .spyderproject

@@ -1,6 +1,8 @@
-import anthropic, boto3, botocore, os, random, pprint, openai
+import anthropic, boto3, botocore, os, random, pprint
+from openai import OpenAI
 import time, json
 from botocore.exceptions import ClientError
+from key import OPENAI_API_KEY
 
 SLEEP_ON_THROTTLING_SEC = 5
 
@@ -127,30 +129,6 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
     return duration_to_first_byte, duration_to_last_byte, invocation_timestamp_iso
 
 '''
-# This method fetches a secret from AWS Secrets manager
-'''
-def get_secret(secret_name):
-    # Create a Secrets Manager client
-    session = boto3.session.Session()
-    client = session.client(
-        service_name='secretsmanager'
-    )
-
-    try:
-        get_secret_value_response = client.get_secret_value(
-            SecretId=secret_name
-        )
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'DecryptionFailureException':
-            # Secrets Manager can't decrypt the protected secret text using the provided KMS key.
-            # Deal with the exception here, and/or rethrow at your discretion.
-            raise e
-        elif e.response['Error']['Code'] == 'InternalServiceErrorException':
-            # An error occurred on the server side.
-            raise e
-    # return the value for the key "openai" in the secret "models"
-    return json.loads(get_secret_value_response['SecretString'])['openai']
-'''
 This method will benchmark the given scenarios.
 scenarios - a list of scenarios to benchmark
 scenario_config - a dictionary of configuration parameters
@@ -170,9 +148,8 @@ def execute_benchmark(scenarios, scenario_config, early_break = False):
                 is_openai_model = modelId.startswith('gpt-')
                 
                 if is_openai_model:
-                    secret = get_secret('models')
                     client = OpenAI(
-                        api_key=secret
+                        api_key=OPENAI_API_KEY
                     )
                 else:
                     client = get_cached_client(scenario['region'], scenario['model_id'])
