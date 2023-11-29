@@ -181,13 +181,14 @@ def execute_benchmark(scenarios, scenario_config, early_break = False):
                 }
                 scenario['invocations'].append(invocation)
 
-                print(f"Scenario: [{scenario['name']}, " + 
+                scenario_label = f"{scenario['model_id']} \n in={scenario['in_tokens']}, out={scenario['out_tokens']}"
+                print(f"Scenario: [{scenario_label}, " + 
                       f'invocation: {pp.pformat((invocation))}')
 
                 post_iteration(is_last_invocation = i == scenario_config["invocations_per_scenario"] - 1, scenario_config=scenario_config)
             except Exception as e:
                 print(e)
-                print(f"Error while processing scenario: {scenario['name']}.")
+                print(f"Error while processing scenario: {scenario_label}.")
             if early_break:
                 break
     return scenarios
@@ -231,24 +232,33 @@ scenarios - list of scenarios
 title - title of the graph
 metric - metric to be plotted (time-to-first-token or time-to-last-token)
 '''
-def graph_scenarios_boxplot(scenarios, title, metric = 'time-to-first-token'):
+def graph_scenarios_boxplot(scenarios, title, metric = 'time-to-first-token', figsize=(10, 6)):
     import numpy as np
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=figsize)
     xlables = []
+    
+    # Angle labels if covering many scenarios, to avoid collisions
+    if len(scenarios) > 4:
+        x_ticks_angle=45
+    else:
+        x_ticks_angle=0
 
     for scenario in scenarios:
       invocations = [d[metric] for d in scenario['invocations']]
       percentile_95 = round(np.percentile(invocations, 95),2)
       percentile_99 = round(np.percentile(invocations, 99),2)
-      xlables.append(f"{scenario['name']}\np95={percentile_95}\np99={percentile_99}")
+
+      # Interpolate in_tokens and out_tokens into the scenario name
+      scenario_label = f"{scenario['model_id']} \n in={scenario['in_tokens']}, out={scenario['out_tokens']}"
+      xlables.append(f"{scenario_label}\np95={percentile_95}\np99={percentile_99}")
 
       ax.boxplot(invocations, positions=[scenarios.index(scenario)])
 
     ax.set_title(title)
     ax.set_xticks(range(len(scenarios)))
-    ax.set_xticklabels(xlables)
+    ax.set_xticklabels(xlables, rotation=x_ticks_angle)
     ax.set_ylabel(f'{metric} (sec)')
     fig.tight_layout()
     plt.show()
