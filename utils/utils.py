@@ -2,7 +2,7 @@ import anthropic, boto3, botocore, os, random, pprint
 from openai import OpenAI
 import time, json
 from botocore.exceptions import ClientError
-from key import OPENAI_API_KEY
+from utils.key import OPENAI_API_KEY
 
 SLEEP_ON_THROTTLING_SEC = 5
 
@@ -78,7 +78,7 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
                     model=modelId
                 )
                 
-                stop_reason = response['choices'][0]['finish_reason']
+                stop_reason = response.choices[0].finish_reason
                 print(f'stop_reason={stop_reason}')
                 last_byte = time.time()
                 first_byte = start
