@@ -88,17 +88,8 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
                     max_tokens=max_tokens_to_sample,
                     stream=stream
                 )
-                if stream:
-                    for chunk in response:
-                        if chunk.choices[0].delta.content is not None:
-                            print(chunk.choices[0].delta.content, end="")
-                        if chunk.choices[0].finish_reason is not None:
-                            stop_reason = chunk.choices[0].finish_reason
-                    
-                else:
-                    print(f'openai response={response}')
+                if not stream:
                     stop_reason = response.choices[0].finish_reason
-                    print(f'stop_reason={stop_reason}')
                     last_byte = time.time()
                     first_byte = start   
             elif stream:
@@ -107,18 +98,16 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
             else:
                 response = client.invoke_model(
                     body=body, modelId=modelId, accept=accept, contentType=contentType)
-            #print(response)
             
             first_byte = None
             dt = datetime.fromtimestamp(time.time(), tz=pytz.utc)
             invocation_timestamp_iso = dt.strftime('%Y-%m-%dT%H:%M:%SZ')
             if stream and is_openai_model:
-                ## FILL IN THE BLANK 
-                
-                
-                
-                print('here now')
-                
+                first_byte = time.time()
+                for chunk in response:
+                    if chunk.choices[0].finish_reason is not None:
+                        stop_reason = chunk.choices[0].finish_reason
+                last_byte = time.time()                
             elif stream:
                 event_stream = response.get('body')
                 for event in event_stream:
@@ -126,7 +115,6 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
                     if chunk:
                         if not first_byte:
                             first_byte = time.time() # update the time to first byte
-                        #print(f'chunk:\n {json.loads(chunk.get('bytes').decode())}')
                 # end of stream - check stop_reson in last chunk
                 stop_reason = json.loads(chunk.get('bytes').decode())['stop_reason']    
                 last_byte = time.time()
@@ -134,18 +122,18 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
                 #no streaming flow
                 first_byte = time.time()
                 last_byte = first_byte
-                if is_openai_model:
-                    response_body = response.choices[0].message.content
-                    stop_reason = response.choices[0].finish_reason
-                else:
-                    response_body = json.loads(response.get('body').read())
-                    stop_reason = response_body['stop_reason']
+                response_body = response.choices[0].message.content
+                stop_reason = response.choices[0].finish_reason
+            else:
+                first_byte = time.time()
+                last_byte = first_byte
+                response_body = json.loads(response.get('body').read())
+                stop_reason = response_body['stop_reason']
 
             
             # verify we got all of the intended output tokens by verifying stop_reason
             valid_stop_reasons = ['max_tokens', 'length']
             assert stop_reason in valid_stop_reasons, f"stop_reason is {stop_reason} instead of 'max_tokens' or 'length', this means the model generated less tokens than required or stopped for a different reason."
-
             duration_to_first_byte = round(first_byte - start, 2)
             duration_to_last_byte = round(last_byte - start, 2)
         except ClientError as err:
