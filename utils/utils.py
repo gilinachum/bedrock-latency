@@ -7,25 +7,34 @@ from utils.key import OPENAI_API_KEY
 SLEEP_ON_THROTTLING_SEC = 5
 
 # This internal method will include arbitrary long input that is designed to generate an extremely long model output
-def _get_prompt_template(num_input_tokens):
-    tokens = 'Human:'
+def _get_prompt_template(num_input_tokens, modelId):
+    # Determine the service based on modelId prefix
+    is_openai_model = modelId.startswith('gpt-')
+    tokens = ''
+    if not is_openai_model:
+        tokens += 'Human:'
     tokens += 'Ignore X' + '<X>'
     for i in range(num_input_tokens-1):
         tokens += random.choice(['hello', 'world', 'foo', 'bar']) + ' '
     tokens += '</X>'
-    tokens += "print numbers 1 to 9999 as words. don't omit for brevity"
-    tokens += '\n\nAssistant:one two'  # model will continue with " three four five..."
+    tokens += "Task: Print numbers from 1 to 9999 as words. Continue listing the numbers in word format until the space runs out. \n"
+    tokens += "One \n"
+    tokens += "two \n"
+    tokens += "three\n"
+    tokens += "..."
+    if not is_openai_model:
+        tokens += '\n\nAssistant:one two'  # model will continue with "four five..."
     return tokens
 
 ''' 
 This method creates a prompt of input length `expected_num_tokens` which instructs the LLM to generate extremely long model resopnse
 '''
 anthropic_client = anthropic.Anthropic() # used to count tokens only
-def create_prompt(expected_num_tokens):
-    num_tokens_in_prompt_template = anthropic_client.count_tokens(_get_prompt_template(0))
+def create_prompt(expected_num_tokens, modelId):
+    num_tokens_in_prompt_template = anthropic_client.count_tokens(_get_prompt_template(0, modelId))
     additional_tokens_needed = max(expected_num_tokens - num_tokens_in_prompt_template,0)
     
-    prompt_template = _get_prompt_template(additional_tokens_needed)
+    prompt_template = _get_prompt_template(additional_tokens_needed, modelId)
     
     actual_num_tokens = anthropic_client.count_tokens(prompt_template)
     #print(f'expected_num_tokens={expected_num_tokens}, actual_tokens={actual_num_tokens}')
@@ -75,12 +84,23 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
                             "content": prompt
                         }
                     ],
-                    model=modelId
+                    model=modelId,
+                    max_tokens=max_tokens_to_sample,
+                    stream=stream
                 )
-                stop_reason = response.choices[0].finish_reason
-                print(f'stop_reason={stop_reason}')
-                last_byte = time.time()
-                first_byte = start   
+                if stream:
+                    for chunk in response:
+                        if chunk.choices[0].delta.content is not None:
+                            print(chunk.choices[0].delta.content, end="")
+                        if chunk.choices[0].finish_reason is not None:
+                            stop_reason = chunk.choices[0].finish_reason
+                    
+                else:
+                    print(f'openai response={response}')
+                    stop_reason = response.choices[0].finish_reason
+                    print(f'stop_reason={stop_reason}')
+                    last_byte = time.time()
+                    first_byte = start   
             elif stream:
                 response = client.invoke_model_with_response_stream(
                     body=body, modelId=modelId, accept=accept, contentType=contentType)
@@ -92,7 +112,14 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
             first_byte = None
             dt = datetime.fromtimestamp(time.time(), tz=pytz.utc)
             invocation_timestamp_iso = dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-            if stream:
+            if stream and is_openai_model:
+                ## FILL IN THE BLANK 
+                
+                
+                
+                print('here now')
+                
+            elif stream:
                 event_stream = response.get('body')
                 for event in event_stream:
                     chunk = event.get('chunk')
@@ -103,7 +130,7 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
                 # end of stream - check stop_reson in last chunk
                 stop_reason = json.loads(chunk.get('bytes').decode())['stop_reason']    
                 last_byte = time.time()
-            else:
+            elif is_openai_model:
                 #no streaming flow
                 first_byte = time.time()
                 last_byte = first_byte
@@ -116,7 +143,8 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
 
             
             # verify we got all of the intended output tokens by verifying stop_reason
-            assert stop_reason == 'max_tokens', f"stop_reason is {stop_reason} instead of 'max_tokens', this means the model generated less tokens than required."
+            valid_stop_reasons = ['max_tokens', 'length']
+            assert stop_reason in valid_stop_reasons, f"stop_reason is {stop_reason} instead of 'max_tokens' or 'length', this means the model generated less tokens than required or stopped for a different reason."
 
             duration_to_first_byte = round(first_byte - start, 2)
             duration_to_last_byte = round(last_byte - start, 2)
@@ -142,8 +170,8 @@ def execute_benchmark(scenarios, scenario_config, early_break = False):
     for scenario in scenarios:
         for i in range(scenario_config["invocations_per_scenario"]): # increase to sample each use case more than once to discover jitter
             try:
-                prompt = create_prompt(scenario['in_tokens'])
                 modelId = scenario['model_id']
+                prompt = create_prompt(scenario['in_tokens'], modelId)
                 
                 # Determine the service based on modelId prefix
                 is_openai_model = modelId.startswith('gpt-')
@@ -188,7 +216,7 @@ def _get_bedrock_client(region, model_id_for_warm_up = None):
                           region_name=region,
                           config=botocore.config.Config(retries=dict(max_attempts=0))) 
     if model_id_for_warm_up:
-        benchmark(client, model_id_for_warm_up, create_prompt(50), 1)
+        benchmark(client, model_id_for_warm_up, create_prompt(50, model_id_for_warm_up), 1)
     return client
 
 '''
