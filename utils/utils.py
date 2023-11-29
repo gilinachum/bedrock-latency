@@ -77,14 +77,11 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
                     ],
                     model=modelId
                 )
-                
                 stop_reason = response.choices[0].finish_reason
                 print(f'stop_reason={stop_reason}')
                 last_byte = time.time()
-                first_byte = start
-                
-                    
-            if stream:
+                first_byte = start   
+            elif stream:
                 response = client.invoke_model_with_response_stream(
                     body=body, modelId=modelId, accept=accept, contentType=contentType)
             else:
@@ -110,8 +107,12 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
                 #no streaming flow
                 first_byte = time.time()
                 last_byte = first_byte
-                response_body = json.loads(response.get('body').read())
-                stop_reason = response_body['stop_reason']
+                if is_openai_model:
+                    response_body = response.choices[0].message.content
+                    stop_reason = response.choices[0].finish_reason
+                else:
+                    response_body = json.loads(response.get('body').read())
+                    stop_reason = response_body['stop_reason']
 
             
             # verify we got all of the intended output tokens by verifying stop_reason
