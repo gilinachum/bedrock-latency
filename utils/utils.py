@@ -1,6 +1,7 @@
 import anthropic, boto3, botocore, os, random, pprint
 from openai import OpenAI
 import time, json
+from copy import deepcopy
 from botocore.exceptions import ClientError
 from utils.key import OPENAI_API_KEY
 
@@ -26,11 +27,55 @@ def _get_prompt_template(num_input_tokens, modelId):
         tokens += '\n\nAssistant:one two'  # model will continue with "four five..."
     return tokens
 
+def _construct_body(modelId, prompt, max_tokens_to_sample, temperature):
+    """
+    Private method to construct the body for model invocation based on the model type.
+    """
+    # OpenAI Models
+    if modelId.startswith('gpt-'):
+        body = json.dumps({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "model": modelId,
+            "max_tokens": max_tokens_to_sample,
+            "temperature": temperature
+        })
+    # Anthropic Models
+    elif modelId.startswith('anthropic.'):
+        body = json.dumps({
+            "prompt": prompt,
+            "max_tokens_to_sample": max_tokens_to_sample,
+            "temperature": temperature,
+            "top_p": 0.9  # Example value, adjust as needed
+        })
+    # A2I Models
+    elif modelId.startswith('ai21.'):
+        body = json.dumps({
+            "prompt": prompt,
+            "maxTokens": max_tokens_to_sample,
+            "temperature": temperature,
+            "topP": 0.5  # Example value, adjust as needed
+        })
+    else:
+        # Default body format if modelId does not match any of the above
+        body = json.dumps({
+            "prompt": prompt,
+            "max_tokens_to_sample": max_tokens_to_sample,
+            "temperature": temperature
+        })
+
+    return body
+
 ''' 
 This method creates a prompt of input length `expected_num_tokens` which instructs the LLM to generate extremely long model resopnse
 '''
 anthropic_client = anthropic.Anthropic() # used to count tokens only
 def create_prompt(expected_num_tokens, modelId):
+    # print(f"create_prompt called with modelId: {modelId}")
     num_tokens_in_prompt_template = anthropic_client.count_tokens(_get_prompt_template(0, modelId))
     additional_tokens_needed = max(expected_num_tokens - num_tokens_in_prompt_template,0)
     
@@ -62,11 +107,7 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
     accept = 'application/json'
     contentType = 'application/json'
     
-    body = json.dumps({
-    "prompt": prompt,
-    "max_tokens_to_sample": max_tokens_to_sample,
-    "temperature": temperature,
-    })
+    body = _construct_body(modelId, prompt, max_tokens_to_sample, temperature)
     
     # Determine the service based on modelId prefix
     is_openai_model = modelId.startswith('gpt-')
@@ -92,12 +133,16 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
                     stop_reason = response.choices[0].finish_reason
                     last_byte = time.time()
                     first_byte = start   
-            elif stream:
+            elif not is_openai_model and stream:
                 response = client.invoke_model_with_response_stream(
                     body=body, modelId=modelId, accept=accept, contentType=contentType)
-            else:
+            elif not is_openai_model and not stream:
                 response = client.invoke_model(
                     body=body, modelId=modelId, accept=accept, contentType=contentType)
+                # print(f'response is {response}')
+                response_body = json.loads(response.get('body').read())
+                # print(f"response body is {response_body}")
+                stop_reason = response_body['completions'][0]['finishReason']['reason']
             
             first_byte = None
             dt = datetime.fromtimestamp(time.time(), tz=pytz.utc)
@@ -108,7 +153,7 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
                     if chunk.choices[0].finish_reason is not None:
                         stop_reason = chunk.choices[0].finish_reason
                 last_byte = time.time()                
-            elif stream:
+            elif not is_openai_model and stream:
                 event_stream = response.get('body')
                 for event in event_stream:
                     chunk = event.get('chunk')
@@ -118,8 +163,7 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
                 # end of stream - check stop_reson in last chunk
                 stop_reason = json.loads(chunk.get('bytes').decode())['stop_reason']    
                 last_byte = time.time()
-            elif is_openai_model:
-                #no streaming flow
+            elif is_openai_model and not stream:
                 first_byte = time.time()
                 last_byte = first_byte
                 response_body = response.choices[0].message.content
@@ -127,9 +171,10 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
             else:
                 first_byte = time.time()
                 last_byte = first_byte
-                response_body = json.loads(response.get('body').read())
-                stop_reason = response_body['stop_reason']
-
+                if modelId.startswith('ai21'):
+                    stop_reason = response_body['completions'][0]['finishReason']['reason']
+                else:
+                    stop_reason = response_body['stop_reason']
             
             # verify we got all of the intended output tokens by verifying stop_reason
             valid_stop_reasons = ['max_tokens', 'length']
@@ -155,11 +200,14 @@ Returns a list of benchmarked scenarios with a list of invocation (latency and t
 def execute_benchmark(scenarios, scenario_config, early_break = False):
     scenarios = scenarios.copy()
     pp = pprint.PrettyPrinter(indent=2)
+    scenarios_list = []
     for scenario in scenarios:
+        scenario_copy = deepcopy(scenario)
         for i in range(scenario_config["invocations_per_scenario"]): # increase to sample each use case more than once to discover jitter
+            scenario_label = f"{scenario_copy['model_id']} \n in={scenario_copy['in_tokens']}, out={scenario_copy['out_tokens']}"
             try:
-                modelId = scenario['model_id']
-                prompt = create_prompt(scenario['in_tokens'], modelId)
+                modelId = scenario_copy['model_id']
+                prompt = create_prompt(scenario_copy['in_tokens'], modelId)
                 
                 # Determine the service based on modelId prefix
                 is_openai_model = modelId.startswith('gpt-')
@@ -169,29 +217,30 @@ def execute_benchmark(scenarios, scenario_config, early_break = False):
                         api_key=OPENAI_API_KEY
                     )
                 else:
-                    client = get_cached_client(scenario['region'], scenario['model_id'])
-                time_to_first_token, time_to_last_token, timestamp = benchmark(client, modelId, prompt, scenario['out_tokens'], stream=scenario['stream'])
+                    client = get_cached_client(scenario_copy['region'], scenario_copy['model_id'])
+                time_to_first_token, time_to_last_token, timestamp = benchmark(client, modelId, prompt, scenario_copy['out_tokens'], stream=scenario_copy['stream'])
 
-                if 'invocations' not in scenario: scenario['invocations'] = list()
+                if 'invocations' not in scenario: scenario_copy['invocations'] = list()
                 invocation = {
                     'time-to-first-token':  time_to_first_token,
                     'time-to-last-token':  time_to_last_token,
-                    'timestamp_iso' : timestamp,
-                    
+                    'timestamp_iso' : timestamp
                 }
-                scenario['invocations'].append(invocation)
+                scenario_copy['invocations'].append(invocation)
 
-                scenario_label = f"{scenario['model_id']} \n in={scenario['in_tokens']}, out={scenario['out_tokens']}"
+                scenario_label = f"{scenario_copy['model_id']} \n in={scenario_copy['in_tokens']}, out={scenario_copy['out_tokens']}"
                 print(f"Scenario: [{scenario_label}, " + 
                       f'invocation: {pp.pformat((invocation))}')
 
                 post_iteration(is_last_invocation = i == scenario_config["invocations_per_scenario"] - 1, scenario_config=scenario_config)
             except Exception as e:
-                print(e)
+                print(f"Error is: {e}")
                 print(f"Error while processing scenario: {scenario_label}.")
             if early_break:
                 break
-    return scenarios
+        scenarios_list.append(scenario_copy)
+    print(f'scenarios at the end of execute benchmark is: {scenario_copy}')
+    return scenarios_list
 
 
 ''' 
@@ -204,8 +253,8 @@ def _get_bedrock_client(region, model_id_for_warm_up = None):
     client = boto3.client( service_name='bedrock-runtime',
                           region_name=region,
                           config=botocore.config.Config(retries=dict(max_attempts=0))) 
-    if model_id_for_warm_up:
-        benchmark(client, model_id_for_warm_up, create_prompt(50, model_id_for_warm_up), 1)
+    # if model_id_for_warm_up:
+    #     benchmark(client, model_id_for_warm_up, create_prompt(50, model_id_for_warm_up), 1)
     return client
 
 '''
@@ -215,6 +264,7 @@ model_id_for_warm_up - the model id to warm up the client against, use None for 
 '''
 client_per_region={}
 def get_cached_client(region, model_id_for_warm_up = None):
+    print(f"get_cached_client called with region: {region}, model_id_for_warm_up: {model_id_for_warm_up}")
     if client_per_region.get(region) is None:
         client_per_region[region] = _get_bedrock_client(region, model_id_for_warm_up)
     return client_per_region[region]
@@ -232,12 +282,13 @@ scenarios - list of scenarios
 title - title of the graph
 metric - metric to be plotted (time-to-first-token or time-to-last-token)
 '''
-def graph_scenarios_boxplot(scenarios, title, metric = 'time-to-first-token', figsize=(10, 6)):
+def graph_scenarios_boxplot(scenarios, title, figsize=(10, 6)):
     import numpy as np
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=figsize)
     xlables = []
+    combined_times = []
     
     # Angle labels if covering many scenarios, to avoid collisions
     if len(scenarios) > 4:
@@ -246,19 +297,27 @@ def graph_scenarios_boxplot(scenarios, title, metric = 'time-to-first-token', fi
         x_ticks_angle=0
 
     for scenario in scenarios:
-      invocations = [d[metric] for d in scenario['invocations']]
-      percentile_95 = round(np.percentile(invocations, 95),2)
-      percentile_99 = round(np.percentile(invocations, 99),2)
+        if 'invocations' in scenario:
+            # Combine the times to first and last token into one list for each scenario
+            times_combined = [d['time-to-first-token'] for d in scenario['invocations']] + \
+                             [d['time-to-last-token'] for d in scenario['invocations']]
+            combined_times.append(times_combined)
 
-      # Interpolate in_tokens and out_tokens into the scenario name
-      scenario_label = f"{scenario['model_id']} \n in={scenario['in_tokens']}, out={scenario['out_tokens']}"
-      xlables.append(f"{scenario_label}\np95={percentile_95}\np99={percentile_99}")
+            scenario_label = f"{scenario['model_id']} \n in={scenario['in_tokens']}, out={scenario['out_tokens']}"
+            xlables.append(scenario_label)
+        else:
+            print(f"No 'invocations' key found in scenario: {scenario}")
 
-      ax.boxplot(invocations, positions=[scenarios.index(scenario)])
+    # Plotting combined times for each scenario
+    ax.boxplot(combined_times)
 
     ax.set_title(title)
-    ax.set_xticks(range(len(scenarios)))
-    ax.set_xticklabels(xlables, rotation=x_ticks_angle)
-    ax.set_ylabel(f'{metric} (sec)')
+    ax.set_xticks(range(1, len(scenarios) + 1))
+    ax.set_xticklabels(xlables, rotation=45, ha="right")
+    ax.set_ylabel('Time (sec)')
+
+    # Set y-axis to start at 0
+    ax.set_ylim(bottom=0)
+
     fig.tight_layout()
     plt.show()
