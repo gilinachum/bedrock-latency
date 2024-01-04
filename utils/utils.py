@@ -117,9 +117,9 @@ def consume_openai_stream(response):
     first_byte = None
     stop_reason = None
     for chunk in response:
+        if not first_byte: 
+            first_byte = time.time() # update the time to first byte
         if chunk.choices[0].finish_reason is not None:
-            if not first_byte: 
-                first_byte = time.time() # update the time to first byte
             stop_reason = chunk.choices[0].finish_reason
     return first_byte, stop_reason
 
@@ -129,10 +129,10 @@ def consume_bedrock_stream(response):
     stop_reason = None
     event_stream = response.get('body')
     for event in event_stream:
+        if not first_byte: 
+            first_byte = time.time() # update the time to first byte
         chunk = event.get('chunk')
         if chunk:
-            if not first_byte: 
-                first_byte = time.time() # update the time to first byte
             # end of stream - check stop_reason in last chunk
             stop_reason = json.loads(chunk.get('bytes').decode())['stop_reason']    
     return first_byte, stop_reason
