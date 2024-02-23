@@ -10,28 +10,43 @@ SLEEP_ON_THROTTLING_SEC = 5
 import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO) # <-- change to DEBUG as needed
 
 def _is_openai(modelId):
     return modelId.startswith('gpt-')
+
+
+def _is_titan(modelId):
+    # True for provisioned models (assuming to be fine-tuned Titan) or Titan.
+    return modelId.startswith('arn:aws:bedrock') or modelId.startswith('amazon.titan')
 
 
 # This internal method will include arbitrary long input that is designed to generate an extremely long model output
 def _get_prompt_template(num_input_tokens, modelId):
     # Determine the service based on modelId prefix
 
+    fillers=''
+    i = num_input_tokens - 1
+    i += 1 if _is_titan(modelId) else 0
+    for i in range(i):
+        fillers += random.choice(['hello', 'world', 'foo', 'bar']) + ' '
+        
     tokens = ''
     if not _is_openai(modelId):
         tokens += 'Human: '
-    tokens += 'Ignore X' + '<X>'
-    for i in range(num_input_tokens-1):
-        tokens += random.choice(['hello', 'world', 'foo', 'bar']) + ' '
-    tokens += '</X>'
-    tokens += 'Task: Print numbers from 1 to 9999 as words. Continue listing the numbers in word format until the space runs out. \n'
-    if _is_openai(modelId):
-        tokens += 'one two three '
+    if _is_titan(modelId):
+        tokens += f'Ignore the following words: {fillers}\n#\n'
     else:
-        tokens += '\n\nAssistant:one two three '  # model will continue with "four five..."
+        tokens += f'Ignore X ' + f'<X>{fillers}</X>\n'
+
+    if _is_titan(modelId):
+        # This task prompt generates around 3K tokens out
+        tokens += 'Task: write a long speech about each of the 50 most important issues of the world. Go into details about each problem with history background and figures involved.'
+    else:
+        tokens += 'Task: Print numbers from 1 to 9999 as words. Continue listing the numbers in word format until the space runs out. \n'
+        if _is_openai(modelId):
+            tokens += 'one two three'
+        else:
+            tokens += '\n\nAssistant:one two three '  # model will continue with "four five..."
     return tokens
 
 
@@ -66,6 +81,22 @@ def _construct_req(modelId, prompt, max_tokens_to_sample, temperature, accept, c
             "contentType" : contentType,
             "modelId" : modelId,
         }
+    # Titan models
+    elif _is_titan(modelId):
+        req = {
+            "body" : json.dumps({
+                "inputText": prompt,
+                "textGenerationConfig": {
+                    "maxTokenCount": max_tokens_to_sample,
+                    "stopSequences": [],
+                    "temperature": temperature,  
+                    "topP": 0.9
+                }
+            }),
+            "accept": accept,
+            "contentType" : contentType,
+            "modelId" : modelId,
+        }
     # A2I Models
     elif modelId.startswith('ai21.'):
         req = {
@@ -92,17 +123,18 @@ def create_prompt(expected_num_tokens, modelId):
     logger.log(logging.DEBUG, f"create_prompt called with modelId: {modelId}")
     num_tokens_in_prompt_template = anthropic_client.count_tokens(_get_prompt_template(0, modelId))
     additional_tokens_needed = max(expected_num_tokens - num_tokens_in_prompt_template,0)
+    logger.log(logging.DEBUG, f'expected_num_tokens={expected_num_tokens}, num_tokens_in_prompt_template={num_tokens_in_prompt_template}, additional_tokens_needed={additional_tokens_needed}')
     
     prompt_template = _get_prompt_template(additional_tokens_needed, modelId)
-    
     actual_num_tokens = anthropic_client.count_tokens(prompt_template)
     logger.log(logging.DEBUG, f'expected_num_tokens={expected_num_tokens}, actual_tokens={actual_num_tokens}')
-    assert expected_num_tokens==actual_num_tokens, f'Failed to generate prompt at required length: expected_num_tokens{expected_num_tokens} != actual_num_tokens={actual_num_tokens}'
+    assert expected_num_tokens==actual_num_tokens, f'Failed to generate prompt at required length: expected_num_tokens={expected_num_tokens} != actual_num_tokens={actual_num_tokens}'
     
     return prompt_template
 
 
 def _send_request(client, modelId, req, stream):
+    
     if _is_openai(modelId):
         response = client.chat.completions.create(**req)
     else:
@@ -134,7 +166,11 @@ def consume_bedrock_stream(response):
         chunk = event.get('chunk')
         if chunk:
             # end of stream - check stop_reason in last chunk
-            stop_reason = json.loads(chunk.get('bytes').decode())['stop_reason']    
+            chunk_json = json.loads(chunk.get('bytes').decode())
+            if 'stop_reason' in chunk_json:
+                stop_reason = chunk_json['stop_reason']
+            if 'completionReason' in chunk_json:
+                stop_reason = chunk_json['completionReason']
     return first_byte, stop_reason
 
 '''
@@ -157,7 +193,6 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
     import pytz
     accept = 'application/json'
     contentType = 'application/json'
-    
     req = _construct_req(modelId, prompt, max_tokens_to_sample, temperature, accept, contentType, stream)
     logger.log(logging.DEBUG, f'req={req}')
    
@@ -171,13 +206,17 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
             response = _send_request(client, modelId, req, stream)
                         
             if not stream:
+                logger.log(logging.DEBUG, f'response={response}')
                 if _is_openai(modelId):
                     response_body = response.choices[0].message.content
                     stop_reason = response.choices[0].finish_reason
                 else:
                     response_body_text = response.get('body').read()
+                    logger.log(logging.DEBUG, f'response_body_text={response_body_text}')
                     response_body = json.loads(response_body_text)
-                    if modelId.startswith('ai21'):
+                    if _is_titan(modelId):
+                        stop_reason = response_body['results'][0]['completionReason']
+                    elif modelId.startswith('ai21'):
                         stop_reason = response_body['completions'][0]['finishReason']['reason']
                     else:
                         stop_reason = response_body['stop_reason']
@@ -192,7 +231,7 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
                 last_byte = time.time()
             
             # verify we got all of the intended output tokens by verifying stop_reason
-            valid_stop_reasons = ['max_tokens', 'length']
+            valid_stop_reasons = ['max_tokens', 'length', 'LENGTH']
             assert stop_reason in valid_stop_reasons, f"stop_reason is {stop_reason} instead of 'max_tokens' or 'length', this means the model generated less tokens than required or stopped for a different reason."
             duration_to_first_byte = round(first_byte - start, 2)
             duration_to_last_byte = round(last_byte - start, 2)
@@ -218,7 +257,8 @@ def execute_benchmark(scenarios, scenario_config, early_break = False):
     scenarios_list = []
     for scenario in scenarios:
         for i in range(scenario_config["invocations_per_scenario"]): # increase to sample each use case more than once to discover jitter
-            scenario_label = f"{scenario['model_id']} \n in={scenario['in_tokens']}, out={scenario['out_tokens']}"
+            scenario_label = f"{scenario['model_id']} in={scenario['in_tokens']}, out={scenario['out_tokens']}"
+            logger.log(logging.INFO, f"About to execute scenario: [{scenario_label}")
             try:
                 modelId = scenario['model_id']
                 prompt = create_prompt(scenario['in_tokens'], modelId)
@@ -239,10 +279,7 @@ def execute_benchmark(scenarios, scenario_config, early_break = False):
                 }
                 scenario['invocations'].append(invocation)
 
-                scenario_label = f"{scenario['model_id']} \n in={scenario['in_tokens']}, out={scenario['out_tokens']}"
-                logger.log(logging.INFO, f"Scenario: [{scenario_label}, " + 
-                      f'invocation: {pp.pformat(invocation)}')
-
+                logger.log(logging.INFO, f"Scenario: [{scenario_label}, invocation: {pp.pformat(invocation)}")
                 post_iteration(is_last_invocation = i == scenario_config["invocations_per_scenario"] - 1, scenario_config=scenario_config)
             except Exception as e:
                 logger.log(logging.CRITICAL, f"Error is: {e}")
@@ -265,7 +302,8 @@ def _get_bedrock_client(region, model_id_for_warm_up = None):
                           region_name=region,
                           config = botocore.config.Config(retries=dict(max_attempts=0))) 
     if model_id_for_warm_up:
-        benchmark(client, model_id_for_warm_up, create_prompt(50, model_id_for_warm_up), 1)
+        logger.log(logging.DEBUG, f"Calling benchmark for client warmup")
+        benchmark(client, model_id_for_warm_up, create_prompt(50, model_id_for_warm_up), 1, stream=False)
     return client
 
 '''
