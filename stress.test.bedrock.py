@@ -1,3 +1,36 @@
+"""
+Bedrock Stress Testing Utility
+
+This script simulates multiple concurrent requests to perform stress testing
+and load testing on Amazon Bedrock, AWS's service for building generative AI
+applications.
+
+Parameters:
+    NUM_OF_THREADS (int): Number of concurrent requests to simulate.
+    MAX_CONNECTION_POOL_SIZE (int): Maximum number of concurrent connections to Bedrock.
+    INVOKE_AUTO_RETRIES (int): Number of automatic retries for failed requests. Normally 0.
+    MODEL_ID (str): ID of the Bedrock model to test.
+    MAX_TOKENS (int): Maximum number of tokens for the model's response.
+    TEMPERATURE (float): Sampling temperature for the model's response.
+    SYSTEM_PROMPT (str): Initial prompt or context for the language model.
+    MESSAGES (list): List of messages to send to the language model.
+
+Usage:
+    1. Configure the parameters according to your testing requirements.
+    2. Run the script from the command line or your Python environment.
+    3. Monitor the output for performance metrics and potential issues.
+"""
+
+NUM_OF_THREADS = 1_000
+MAX_CONNECTION_POOL_SIZE = 10
+INVOKE_AUTO_RETRIES = 0
+
+MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
+MAX_TOKENS = 500
+TEMPERATURE = 0
+SYSTEM_PROMPT = "You are a nice person."
+MESSAGES = [{"role": "user", "content": "Explain how distributed training works in 1000 words"}]
+
 import json
 import os
 import threading
@@ -8,17 +41,15 @@ from botocore.exceptions import ClientError
 import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+import boto3
+from botocore.config import Config
 
-''' 
-Get a boto3 bedrock runtime client for invoking requests
-region - the AWS region to use
-model_id_for_warm_up - the model id to warm up the client against, use None for no warmup
-Note: Removing auto retries to ensure we're measuring a single transcation (e.g., in case of throttling).
-'''
 def _get_bedrock_client(region, model_id_for_warm_up = None):
     client = boto3.client(service_name='bedrock-runtime',
                           region_name=region,
-                          config = botocore.config.Config(retries=dict(max_attempts=0))) 
+                          config = botocore.config.Config(
+                              retries=dict(max_attempts=INVOKE_AUTO_RETRIES), 
+                              max_pool_connections=MAX_CONNECTION_POOL_SIZE)) 
     return client
 
 def _send_request(client, req):
@@ -51,17 +82,10 @@ throttled_requests = 0
 def invoke_agent(thread_id):
     global total_requests, successful_requests, failed_requests, empty_responses, throttled_requests
     try:
-        model_id = "anthropic.claude-3-haiku-20240307-v1:0"
-        #model_id = 'anthropic.claude-3-sonnet-20240229-v1:0'
-        user_message =  {"role": "user", "content": "Explain how distributed training works in 1000 words"}
-        messages = [user_message]
-        system_prompt = "You are a nice person."
-        max_tokens = 500
-        temperature = 1
-        body = construct_body(messages, system_prompt, max_tokens, temperature)
+        body = construct_body(MESSAGES, SYSTEM_PROMPT, MAX_TOKENS, TEMPERATURE)
         total_requests += 1
         
-        response = bedrock.invoke_model(body=body, modelId=model_id)
+        response = bedrock.invoke_model(body=body, modelId=MODEL_ID)
         
         logger.log(logging.DEBUG, f'threadId={thread_id}, response={response}')
         response_body = json.loads(response.get('body').read())
@@ -86,11 +110,10 @@ def invoke_agent(thread_id):
     except Exception as e:
         print(f"Error: {e}")
 
-
 # Create and start the threads
 threads = []
 start_time = time.time()
-for i in range(1000):
+for i in range(NUM_OF_THREADS):
     thread = threading.Thread(target=invoke_agent, args=[str(i)])
     threads.append(thread)
     thread.start()
