@@ -3,13 +3,19 @@ from openai import OpenAI
 import time, json
 from copy import deepcopy
 from botocore.exceptions import ClientError
-from utils.key import OPENAI_API_KEY
-
-SLEEP_ON_THROTTLING_SEC = 5
 
 import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+try:
+    from utils.key import OPENAI_API_KEY
+except:
+    logger.log(logging.WARN, f"Could not load open AI Key. Will not be able to test OpenAI models. If you want to test openAI models see intstructions in the notebook.")
+
+SLEEP_ON_THROTTLING_SEC = 5
+
+
 
 def _is_openai(modelId):
     return modelId.startswith('gpt-')
@@ -72,13 +78,21 @@ def _construct_req(modelId, prompt, max_tokens_to_sample, temperature, accept, c
     elif modelId.startswith('anthropic.'):
         req = {
             "body" : json.dumps({
-                "prompt": prompt,
-                "max_tokens_to_sample": max_tokens_to_sample,
+                #"system": system_prompt,
+                "anthropic_version": "bedrock-2023-05-31",    
+                "max_tokens": max_tokens_to_sample,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            { "type": "text", "text": prompt }
+                        ]
+                    }
+                ],
                 "temperature": temperature,
                 "top_p": 0.9  # Example value, adjust as needed
+                # "stop_sequences": [string]
             }),
-            "accept": accept,
-            "contentType" : contentType,
             "modelId" : modelId,
         }
     # Titan models
@@ -167,6 +181,9 @@ def consume_bedrock_stream(response):
         if chunk:
             # end of stream - check stop_reason in last chunk
             chunk_json = json.loads(chunk.get('bytes').decode())
+            logger.log(logging.DEBUG, f'chunk_json={chunk_json}')
+            if 'delta' in chunk_json and 'stop_reason' in chunk_json['delta']: # Messages API
+                stop_reason = chunk_json['delta']['stop_reason']
             if 'stop_reason' in chunk_json:
                 stop_reason = chunk_json['stop_reason']
             if 'completionReason' in chunk_json:
