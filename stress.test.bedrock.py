@@ -6,7 +6,9 @@ and load testing on Amazon Bedrock, AWS's service for building generative AI
 applications.
 
 Parameters:
-    NUM_OF_THREADS (int): Number of concurrent requests to simulate.
+    NUM_OF_THREADS (int): Number of concurrent threads to simulate.
+    INVOCATIONS_PER_THREAD (int): Number of invocations each thread will perform.
+    SLEEP_BETWEEN_INVOCATIONS (float): Time to sleep between invocations in milliseconds.
     MAX_CONNECTION_POOL_SIZE (int): Maximum number of concurrent connections to Bedrock.
     INVOKE_AUTO_RETRIES (int): Number of automatic retries for failed requests. Normally 0.
     MODEL_ID (str): ID of the Bedrock model to test.
@@ -21,7 +23,9 @@ Usage:
     3. Monitor the output for performance metrics and potential issues.
 """
 
-NUM_OF_THREADS = 1_000
+NUM_OF_THREADS = 10
+INVOCATIONS_PER_THREAD = 5
+SLEEP_BETWEEN_INVOCATIONS = 0  # milliseconds
 MAX_CONNECTION_POOL_SIZE = 10
 INVOKE_AUTO_RETRIES = 0
 
@@ -56,7 +60,6 @@ def _send_request(client, req):
     response = client.invoke_model(**req)
     return response
 
-
 def construct_body(messages, system_prompt, max_tokens, temperature) -> str:
     body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
@@ -67,7 +70,6 @@ def construct_body(messages, system_prompt, max_tokens, temperature) -> str:
         })
     return body
 
-
 bedrock = _get_bedrock_client('us-east-1', None)
 
 # Set up variables to track results
@@ -77,38 +79,43 @@ failed_requests = 0
 empty_responses = 0
 throttled_requests = 0
 
-
 # Define the function to be executed by each thread
 def invoke_agent(thread_id):
     global total_requests, successful_requests, failed_requests, empty_responses, throttled_requests
-    try:
-        body = construct_body(MESSAGES, SYSTEM_PROMPT, MAX_TOKENS, TEMPERATURE)
-        total_requests += 1
+    
+    for invocation in range(INVOCATIONS_PER_THREAD):
+        try:
+            body = construct_body(MESSAGES, SYSTEM_PROMPT, MAX_TOKENS, TEMPERATURE)
+            total_requests += 1
+            
+            response = bedrock.invoke_model(body=body, modelId=MODEL_ID)
+            
+            logger.log(logging.DEBUG, f'threadId={thread_id}, invocation={invocation}, response={response}')
+            response_body = json.loads(response.get('body').read())
+            stop_reason = response_body['stop_reason']
+            first_byte = time.time()
+            last_byte = first_byte
+            logger.log(logging.DEBUG, f"threadId={thread_id}, invocation={invocation}, body={response_body}")
+            statusCode = response['ResponseMetadata']['HTTPStatusCode']
+            if statusCode == 200:
+                successful_requests += 1
+                if len(response_body) == 0:
+                    empty_responses += 1
+            else:
+                failed_requests += 1
+                logger.log(logging.WARNING, f"threadId={thread_id}, invocation={invocation}, Error statusCode={statusCode}")
+        except ClientError as err:
+            if 'Thrott' in err.response['Error']['Code']:
+                failed_requests += 1
+                throttled_requests += 1
+                logger.log(logging.WARNING, f'thread_id={thread_id}, invocation={invocation}, Got ThrottlingException')
+            raise err
+        except Exception as e:
+            print(f"Error: {e}")
         
-        response = bedrock.invoke_model(body=body, modelId=MODEL_ID)
-        
-        logger.log(logging.DEBUG, f'threadId={thread_id}, response={response}')
-        response_body = json.loads(response.get('body').read())
-        stop_reason = response_body['stop_reason']
-        first_byte = time.time()
-        last_byte = first_byte
-        logger.log(logging.DEBUG, f"threadId={thread_id}, body={response_body}")
-        statusCode = response['ResponseMetadata']['HTTPStatusCode']
-        if statusCode == 200:
-            successful_requests += 1
-            if len(response_body) == 0:
-                empty_responses += 1
-        else:
-            failed_requests += 1
-            logger.log(logging.WARNING, f"threadId={thread_id}, Error statusCode={statusCode}")
-    except ClientError as err:
-        if 'Thrott' in err.response['Error']['Code']:
-            failed_requests += 1
-            throttled_requests += 1
-            logger.log(logging.WARNING, f'thread_id={thread_id}, Got ThrottlingException')
-        raise err
-    except Exception as e:
-        print(f"Error: {e}")
+        # Sleep between invocations
+        if invocation < INVOCATIONS_PER_THREAD - 1:  # Don't sleep after the last invocation
+            time.sleep(SLEEP_BETWEEN_INVOCATIONS / 1000)  # Convert milliseconds to seconds
 
 # Create and start the threads
 threads = []
